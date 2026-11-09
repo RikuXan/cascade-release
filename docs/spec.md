@@ -95,7 +95,7 @@ The plan job decides the mode of a run, and the other jobs follow it:
 
 Calling a reusable workflow hands GitHub its YAML file and nothing else: the jobs run with the
 *consumer's* repository checked out, so `scripts/` and `cliff.toml` are not there. Each job that
-needs them downloads this repository at exactly the commit the called workflow came from:
+needs them downloads this repository at exactly the revision the called workflow was loaded from:
 
 ```sh
 gh api "repos/${{ job.workflow_repository }}/tarball/${{ job.workflow_sha }}" | tar --extract --gzip …
@@ -104,6 +104,12 @@ gh api "repos/${{ job.workflow_repository }}/tarball/${{ job.workflow_sha }}" | 
 - `job.workflow_repository` and `job.workflow_sha` identify the *called* workflow; the `github.*`
   contexts describe the caller. A consumer that pins `@0.1.0` therefore gets the planner, the
   git-cliff configuration and the tool pins of `0.1.0`, with no second reference to keep in sync.
+- `job.workflow_sha` is the object the consumer's reference resolved to when the run started: a
+  commit for a branch or a SHA, the *tag object* for an annotated tag such as `@0.1.0`. The
+  tarball endpoint accepts both and returns the same tree.
+- `job.workflow_ref` is no substitute. It is the workflow file's path plus a ref name
+  (`…/image-chart.yml@refs/tags/0.1.0`), and a ref can move between the jobs of one run, which
+  would let the jobs run different versions of the scripts.
 - The files land in `$RUNNER_TEMP/cascade-release`, outside the workspace, so they never end up in
   the consumer's Docker build context.
 - The download uses the consumer's `GITHUB_TOKEN`, which can read its own repository and public
