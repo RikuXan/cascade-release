@@ -1,0 +1,9 @@
+image:
+  repository: ghcr.io/rikuxan/cascade-release-fixture
+  # Override as a pair or not at all: setting either one replaces the shipped image.
+  tag: ""
+  digest: ""
+  # Written by cascade-release when the chart is packaged; never set by hand.
+  shipped:
+    tag: ""
+    digest: ""

@@ -1,0 +1,44 @@
+[changelog]
+body = """
+{%- set repository = get_env(name="GITHUB_REPOSITORY", default="") -%}
+{%- set server = get_env(name="GITHUB_SERVER_URL", default="https://github.com") -%}
+{%- macro entry(commit, repository, server) -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% if commit.breaking and commit.breaking_description and commit.breaking_description != commit.message %}\
+: {{ commit.breaking_description }}{% endif %} \
+({% if repository %}[`{{ commit.id | truncate(length=7, end="") }}`]({{ server }}/{{ repository }}/commit/{{ commit.id }})\
+{% else %}`{{ commit.id | truncate(length=7, end="") }}`{% endif %})
+{%- endmacro entry -%}
+{%- set breaking = commits | filter(attribute="breaking", value=true) -%}
+{% if breaking | length > 0 %}
+### Breaking Changes
+
+{% for commit in breaking -%}
+{{ self::entry(commit=commit, repository=repository, server=server) }}
+{% endfor -%}
+{% endif -%}
+{% for group, commits in commits | filter(attribute="breaking", value=false) | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+
+{% for commit in commits -%}
+{{ self::entry(commit=commit, repository=repository, server=server) }}
+{% endfor -%}
+{% endfor -%}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+protect_breaking_commits = true
+# First match wins. The numeric comments order the sections; the template strips them.
+commit_parsers = [
+    { message = "^feat", group = "<!-- 1 -->Features" },
+    { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
+    { message = "^chore\\(deps", group = "<!-- 3 -->Dependencies" },
+    { message = ".*", skip = true },
+]
+
+[bump]
+breaking_always_bump_major = false
+features_always_bump_minor = true

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+  echo "usage: publish-release <tag> <target-commit> <title> <notes-file> [latest: true|false]" >&2
+  exit 2
+fi
+
+tag=$1
+target=$2
+title=$3
+notes=$4
+latest=${5:-false}
+
+if existing=$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}"); then
+  if [ "$existing" != "$target" ]; then
+    echo "::error::Tag ${tag} already exists on ${existing}, but the plan wants it on ${target}. The plan is stale: re-run all jobs." >&2
+    exit 1
+  fi
+  echo "Tag ${tag} already exists on ${target}"
+else
+  git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+    tag --annotate "$tag" --message "$title" "$target"
+  git push origin "refs/tags/${tag}"
+fi
+
+if gh release view "$tag" > /dev/null 2>&1; then
+  echo "Release ${tag} already exists"
+else
+  gh release create "$tag" --verify-tag --title "$title" --notes-file "$notes" --latest="$latest"
+fi

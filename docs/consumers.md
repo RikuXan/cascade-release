@@ -1,5 +1,8 @@
 # Consumers
 
+Before the first consumer run, cascade-release has to be public and have its own first release
+(`0.1.0`) for consumers to pin; see [requirements.md](requirements.md#delivery-to-consumers).
+
 ## agent-workstation
 
 First consumer. Its Argo CD deployment on hk3s waits for the first release from

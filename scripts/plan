@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+INITIAL_VERSION = "0.1.0"
+# Bytes. A GitHub Release body holds 125000 characters and the workflow passes notes through an environment variable (128 KiB).
+NOTES_LIMIT = 100_000
+DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "cliff.toml"
+
+
+class PlanError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Family:
+    name: str
+    prefix: str
+    paths: tuple[str, ...]
+
+    @property
+    def pattern(self) -> str:
+        return rf"^{re.escape(self.prefix)}\d+\.\d+\.\d+$"
+
+    def version_of(self, tag: str) -> str:
+        return tag[len(self.prefix) :]
+
+
+@dataclass(frozen=True)
+class Plan:
+    family: Family
+    previous: str | None
+    tag: str | None = None
+    target: str | None = None
+    notes: str = ""
+
+    @property
+    def due(self) -> bool:
+        return self.tag is not None
+
+    @property
+    def version(self) -> str:
+        return self.family.version_of(self.tag) if self.tag else ""
+
+    @property
+    def previous_version(self) -> str:
+        return self.family.version_of(self.previous) if self.previous else ""
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def capped(notes: str) -> str:
+    encoded = notes.encode()
+    if len(encoded) <= NOTES_LIMIT:
+        return notes
+    kept = encoded[:NOTES_LIMIT].decode(errors="ignore").rsplit("\n", 1)[0]
+    omitted = notes.count("\n- ") - kept.count("\n- ")
+    return f"{kept}\n\n_{omitted} more entries are not shown; see the commit history._"
+
+
+def parse_paths(text: str) -> tuple[str, ...]:
+    paths = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if not paths:
+        raise PlanError("no paths given")
+    return paths
+
+
+class Planner:
+    def __init__(self, repository: Path, config: Path):
+        self.repository = repository
+        self.config = config
+        self.cliff_binary = os.environ.get("GIT_CLIFF", "git-cliff")
+
+    def run(self, *command: str, env: dict[str, str] | None = None) -> str:
+        result = subprocess.run(
+            command,
+            cwd=self.repository,
+            env={**os.environ, **(env or {})},
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise PlanError(f"`{' '.join(command)}` failed:\n{result.stderr.strip()}")
+        return result.stdout
+
+    def git(self, *args: str) -> str:
+        return self.run("git", *args).strip()
+
+    def cliff(self, family: Family, *args: str) -> str:
+        return self.run(
+            self.cliff_binary,
+            "--config",
+            str(self.config),
+            "--tag-pattern",
+            family.pattern,
+            *args,
+            env={"GIT_CLIFF__BUMP__INITIAL_TAG": family.prefix + INITIAL_VERSION},
+        )
+
+    def require_full_clone(self) -> None:
+        if self.git("rev-parse", "--is-shallow-repository") == "true":
+            raise PlanError(
+                "shallow clone: the planner needs the whole history and all tags "
+                "(actions/checkout with fetch-depth: 0)"
+            )
+
+    def previous_tag(self, family: Family) -> str | None:
+        pattern = re.compile(family.pattern)
+        tags = [tag for tag in self.git("tag", "--merged", "HEAD").splitlines() if pattern.match(tag)]
+        return max(tags, key=lambda tag: version_key(family.version_of(tag)), default=None)
+
+    def plan(self, family: Family) -> Plan:
+        previous = self.previous_tag(family)
+        revisions = f"refs/tags/{previous}..HEAD" if previous else "HEAD"
+        commits = self.git("rev-list", "--topo-order", revisions, "--", *family.paths).split()
+        if not commits:
+            return Plan(family, previous)
+
+        context = json.loads(self.cliff(family, "--context", *([revisions] if previous else [])))
+        position = {commit: index for index, commit in enumerate(commits)}
+        releasable = sorted(
+            (commit for release in context for commit in release["commits"] if commit["id"] in position),
+            key=lambda commit: position[commit["id"]],
+            reverse=True,
+        )
+        if not releasable:
+            return Plan(family, previous)
+
+        # git-cliff must not look for the previous release itself: it misses a tag on a commit outside its filters.
+        release = {**context[0], "version": None, "commits": releasable, "previous": None}
+        if previous:
+            release["previous"] = {**context[0], "version": previous, "commits": [], "previous": None}
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as pinned:
+            json.dump([release], pinned)
+            pinned.flush()
+            tag = self.cliff(family, "--from-context", pinned.name, "--bumped-version").strip()
+            notes = capped(self.cliff(family, "--from-context", pinned.name).strip())
+
+        if not re.match(family.pattern, tag):
+            raise PlanError(f"{family.name}: next version {tag!r} does not match {family.pattern}")
+        if previous and version_key(family.version_of(tag)) <= version_key(family.version_of(previous)):
+            raise PlanError(f"{family.name}: next version {tag} is not above the previous release {previous}")
+        return Plan(family, previous, tag, commits[0], notes)
+
+
+def outputs(plan: Plan, prefix: str = "") -> dict[str, str]:
+    return {
+        f"{prefix}due": "true" if plan.due else "false",
+        f"{prefix}previous": plan.previous_version,
+        f"{prefix}version": plan.version,
+        f"{prefix}tag": plan.tag or "",
+        f"{prefix}target": plan.target or "",
+    }
+
+
+def summary(plans: list[tuple[Plan, str]]) -> str:
+    lines = ["## Release plan", "", "| Family | Previous | Next | Tag target |", "| --- | --- | --- | --- |"]
+    for plan, _ in plans:
+        previous = f"`{plan.previous}`" if plan.previous else "none"
+        if plan.due:
+            lines.append(f"| {plan.family.name} | {previous} | **`{plan.tag}`** | `{plan.target[:7]}` |")
+        else:
+            lines.append(f"| {plan.family.name} | {previous} | no release | |")
+    for plan, preface in plans:
+        if plan.due:
+            body = re.sub(r"^###", "####", plan.notes, flags=re.MULTILINE)
+            lines += ["", f"### {plan.family.name} `{plan.tag}`", *(["", preface] if preface else []), "", body]
+    return "\n".join(lines) + "\n"
+
+
+def plan_image_chart(planner: Planner, args: argparse.Namespace) -> tuple[dict[str, str], dict[str, str], str]:
+    image = planner.plan(Family("image", args.image_tag_prefix, parse_paths(args.image_paths)))
+    chart = planner.plan(Family("chart", args.chart_tag_prefix, parse_paths(args.chart_paths)))
+    app_version = ""
+    if chart.due:
+        app_version = image.version or image.previous_version
+        if not app_version:
+            raise PlanError(
+                f"chart {chart.tag} is due, but there is no image for it to pin: no commit on the image "
+                f"paths is releasable and no tag matching {image.family.pattern} is reachable from HEAD"
+            )
+    preface = f"Pins image version `{app_version}`."
+    return (
+        {**outputs(image, "image-"), **outputs(chart, "chart-"), "chart-app-version": app_version},
+        {"image-notes": image.notes, "chart-notes": chart.notes},
+        summary([(image, ""), (chart, preface)]),
+    )
+
+
+def plan_tags(planner: Planner, args: argparse.Namespace) -> tuple[dict[str, str], dict[str, str], str]:
+    plan = planner.plan(Family("release", args.tag_prefix, parse_paths(args.paths)))
+    return outputs(plan), {"notes": plan.notes}, summary([(plan, "")])
+
+
+def write_github_output(path: Path, values: dict[str, str], notes: dict[str, str]) -> None:
+    with path.open("a") as handle:
+        for key, value in values.items():
+            handle.write(f"{key}={value}\n")
+        for key, text in notes.items():
+            delimiter = f"notes-{secrets.token_hex(16)}"
+            handle.write(f"{key}<<{delimiter}\n{text}\n{delimiter}\n")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Decide per release family whether, what and where to release. "
+        "Prints key=value lines and writes <family>-notes.md and summary.md to the output directory."
+    )
+    parser.add_argument("--repository", type=Path, default=Path.cwd())
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--github-output", type=Path, help="also append the values and the notes to this file")
+    modes = parser.add_subparsers(dest="mode", required=True)
+
+    image_chart = modes.add_parser("image-chart", help="an image family and the chart family that ships it")
+    image_chart.add_argument("--image-paths", required=True, help="newline-separated git pathspecs")
+    image_chart.add_argument("--chart-paths", required=True, help="newline-separated git pathspecs")
+    image_chart.add_argument("--image-tag-prefix", default="")
+    image_chart.add_argument("--chart-tag-prefix", default="chart-")
+    image_chart.set_defaults(handler=plan_image_chart)
+
+    tags = modes.add_parser("tags", help="a single family that is released as a git tag only")
+    tags.add_argument("--paths", required=True, help="newline-separated git pathspecs")
+    tags.add_argument("--tag-prefix", default="")
+    tags.set_defaults(handler=plan_tags)
+
+    args = parser.parse_args()
+    try:
+        planner = Planner(args.repository, args.config)
+        planner.require_full_clone()
+        values, notes, overview = args.handler(planner, args)
+    except PlanError as error:
+        print(f"plan: {error}", file=sys.stderr)
+        return 1
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in notes.items():
+        (args.output_dir / f"{name}.md").write_text(f"{text}\n" if text else "")
+    (args.output_dir / "summary.md").write_text(overview)
+    if args.github_output:
+        write_github_output(args.github_output, values, notes)
+    for key, value in values.items():
+        print(f"{key}={value}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+      - name: shellcheck
+        run: shellcheck scripts/publish-release
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          # renovate: datasource=github-releases depName=helm/helm
+          version: v4.3.1
+      - name: Install git-cliff
+        run: |
+          python3 -m venv "$RUNNER_TEMP/planner"
+          "$RUNNER_TEMP/planner/bin/pip" install --quiet --disable-pip-version-check --require-hashes \
+            --requirement scripts/requirements.txt
+      - name: Planner and chart contract tests
+        env:
+          GIT_CLIFF: ${{ runner.temp }}/planner/bin/git-cliff
+        run: python3 -m unittest discover --start-directory tests --verbose
+
+  dry-run:
+    uses: ./.github/workflows/image-chart.yml
+    permissions:
+      contents: write
+      packages: write
+    with:
+      image: ghcr.io/rikuxan/cascade-release-fixture
+      image-paths: |
+        testing/Dockerfile
+        testing/rootfs/**
+      chart-path: testing/charts/fixture
+      context: testing
+      dockerfile: testing/Dockerfile
+      image-tag-prefix: fixture-
+      chart-tag-prefix: fixture-chart-
+      dry-run: true
+
+  dry-run-result:
+    needs: dry-run
+    runs-on: ubuntu-24.04
+    steps:
+      # Without this, a dry run that plans nothing skips the build and the packaging and still passes.
+      - name: The dry run built the fixture image and packaged the fixture chart
+        env:
+          IMAGE_VERSION: ${{ needs.dry-run.outputs.image-version }}
+          IMAGE_DIGEST: ${{ needs.dry-run.outputs.image-digest }}
+          IMAGE_RELEASED: ${{ needs.dry-run.outputs.image-released }}
+          CHART_VERSION: ${{ needs.dry-run.outputs.chart-version }}
+          CHART_RELEASED: ${{ needs.dry-run.outputs.chart-released }}
+        run: |
+          env | grep -E '^(IMAGE|CHART)_' | sort
+          [ "$IMAGE_VERSION" = 0.1.0 ]
+          [ "$CHART_VERSION" = 0.1.0 ]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:0{64}$ ]]
+          [ "$IMAGE_RELEASED" = false ]
+          [ "$CHART_RELEASED" = false ]
