@@ -61,13 +61,15 @@ git-cliff); the lessons learned there are folded into [spec.md](spec.md#pitfalls
 
 ## Non-functional requirements
 
-- **Private repository.** Consumers are Philipp's own repositories; the repo's
-  *Settings → Actions → General → Access* must be "Accessible from repositories owned by
-  RikuXan" before any consumer can call it.
+- **Public repository.** Consumers are Philipp's own, private repositories, and the first plan
+  was to keep cascade-release private too. That does not work: a reusable workflow has to fetch
+  its planner and configuration from this repository while it runs in the consumer, and the
+  consumer's `GITHUB_TOKEN` cannot read another private repository (see
+  [Delivery](#delivery-to-consumers)). Nothing here is secret, so the repository is public.
 - **Pinned tooling**, updated by Renovate: actions by version or digest, git-cliff (≥ 2.14), helm,
   yq, crane.
-- **Testable without a consumer:** the planner is a script with its own tests, and the
-  component's CI dry-runs the whole workflow against a fixture image and chart in this repo.
+- **Testable without a consumer:** the planner and the release script have their own tests, and
+  the component's CI dry-runs the whole workflow against a fixture image and chart in this repo.
 - **Small interface:** only inputs a known consumer needs. New inputs arrive with the consumer that
   needs them.
 
@@ -92,3 +94,18 @@ git-cliff); the lessons learned there are folded into [spec.md](spec.md#pitfalls
 | convco | Versions and changelogs with git pathspecs, but per-type bump rules (`chore(deps)` → patch) and per-family prefixes are undocumented; smaller project. |
 | One shared version for image and chart | Simpler, but Philipp wants image and chart releases distinguishable. |
 | Develop inside agent-workstation, extract later | calcium already needs the same thing, so the component starts in its own repo. |
+
+### Delivery to consumers
+
+A called reusable workflow consists of its YAML file only. The planner, the git-cliff
+configuration and the release script have to reach the runner some other way, at the version the
+consumer pinned. A probe on 2026-11-09 showed that a private cascade-release cannot be fetched
+with the consumer's `GITHUB_TOKEN`, even with *Settings → Actions → General → Access* set to
+"Accessible from repositories owned by RikuXan" ([spec](spec.md#pitfalls)).
+
+| Option | Verdict |
+| --- | --- |
+| **Public repository**, reusable workflow fetches itself at `job.workflow_sha` | **Chosen.** Keeps the interface, the three jobs with their own permissions and the concurrency group inside the component. Costs the private repository. |
+| Composite action (`uses: RikuXan/cascade-release@<version>` as a step) | Works privately, because the runner downloads the whole repository for an action. But it is one job, and every caller has to write `runs-on`, the permissions and the concurrency group itself. |
+| Scripts inlined into the workflow YAML by a generator | Works privately and keeps the interface, at the price of a generated ~250-line Python block in the workflow and a sync check on every planner change. |
+| Access token as a secret in every consumer | Works privately and keeps the interface, but each consumer gets a secret to create and rotate, and an expired token blocks releases. |
