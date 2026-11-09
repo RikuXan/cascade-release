@@ -1,0 +1,6 @@
+apiVersion: v2
+name: fixture
+description: Fixture consumer chart for the cascade-release dry run and the chart contract tests
+type: application
+version: 0.0.0
+appVersion: "0.0.0"

@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      due: ${{ steps.plan.outputs.due }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      target: ${{ steps.plan.outputs.target }}
+      notes: ${{ steps.plan.outputs.notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install git-cliff
+        run: |
+          python3 -m venv "$RUNNER_TEMP/planner"
+          "$RUNNER_TEMP/planner/bin/pip" install --quiet --disable-pip-version-check --require-hashes \
+            --requirement scripts/requirements.txt
+      - name: Plan
+        id: plan
+        env:
+          GIT_CLIFF: ${{ runner.temp }}/planner/bin/git-cliff
+          # What a consumer runs when it pins a version of this repository.
+          RELEASE_PATHS: |
+            .github/workflows/image-chart.yml
+            scripts/**
+            cliff.toml
+        run: |
+          scripts/plan --output-dir "$RUNNER_TEMP/plan" --github-output "$GITHUB_OUTPUT" \
+            tags --paths "$RELEASE_PATHS"
+          cat "$RUNNER_TEMP/plan/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.due == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          TARGET: ${{ needs.plan.outputs.target }}
+          NOTES: ${{ needs.plan.outputs.notes }}
+        run: |
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.md"
+          scripts/publish-release "$TAG" "$TARGET" "$VERSION" "$RUNNER_TEMP/notes.md" true

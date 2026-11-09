@@ -1,0 +1,329 @@
+name: Image and chart release
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image repository, e.g. ghcr.io/rikuxan/agent-workstation
+        required: true
+        type: string
+      image-paths:
+        description: Newline-separated git pathspecs that make up the image; must cover everything the Docker build reads
+        required: true
+        type: string
+      chart-path:
+        description: Chart directory, e.g. charts/agent-workstation
+        required: true
+        type: string
+      chart-paths:
+        description: Pathspecs of the chart family; defaults to <chart-path>/** plus image-paths
+        default: ""
+        type: string
+      context:
+        description: Docker build context
+        default: .
+        type: string
+      dockerfile:
+        description: Dockerfile path
+        default: Dockerfile
+        type: string
+      platforms:
+        description: Build platforms
+        default: linux/amd64
+        type: string
+      chart-registry:
+        description: OCI registry the chart is pushed to; defaults to oci://ghcr.io/<lowercased owner>/charts
+        default: ""
+        type: string
+      image-tag-prefix:
+        description: Git tag prefix of the image family
+        default: ""
+        type: string
+      chart-tag-prefix:
+        description: Git tag prefix of the chart family
+        default: chart-
+        type: string
+      shipped-tag-key:
+        description: yq path in the chart's values.yaml that receives the released image tag
+        default: .image.shipped.tag
+        type: string
+      shipped-digest-key:
+        description: yq path in the chart's values.yaml that receives the released image digest
+        default: .image.shipped.digest
+        type: string
+      dry-run:
+        description: Build and package everything, push and tag nothing
+        default: false
+        type: boolean
+    outputs:
+      image-released:
+        description: "'true' if this run released an image"
+        value: ${{ jobs.image.outputs.released == 'true' }}
+      image-version:
+        description: Image version this run releases (in a preview or dry run, would release), or else the newest existing one
+        value: ${{ jobs.plan.outputs.image-version || jobs.plan.outputs.image-previous }}
+      image-digest:
+        description: Digest of image-version, if this run built the image or released a chart
+        value: ${{ jobs.image.outputs.digest || jobs.chart.outputs.image-digest }}
+      chart-released:
+        description: "'true' if this run released a chart"
+        value: ${{ jobs.chart.outputs.released == 'true' }}
+      chart-version:
+        description: Chart version this run releases (in a preview or dry run, would release), or empty
+        value: ${{ jobs.plan.outputs.chart-version }}
+
+permissions: {}
+
+concurrency:
+  group: cascade-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      image-due: ${{ steps.plan.outputs.image-due }}
+      image-previous: ${{ steps.plan.outputs.image-previous }}
+      image-version: ${{ steps.plan.outputs.image-version }}
+      image-tag: ${{ steps.plan.outputs.image-tag }}
+      image-target: ${{ steps.plan.outputs.image-target }}
+      image-notes: ${{ steps.plan.outputs.image-notes }}
+      chart-due: ${{ steps.plan.outputs.chart-due }}
+      chart-version: ${{ steps.plan.outputs.chart-version }}
+      chart-tag: ${{ steps.plan.outputs.chart-tag }}
+      chart-target: ${{ steps.plan.outputs.chart-target }}
+      chart-app-version: ${{ steps.plan.outputs.chart-app-version }}
+      chart-notes: ${{ steps.plan.outputs.chart-notes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch cascade-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CASCADE_REPOSITORY: ${{ job.workflow_repository }}
+          CASCADE_SHA: ${{ job.workflow_sha }}
+        run: |
+          mkdir "$RUNNER_TEMP/cascade-release"
+          gh api "repos/$CASCADE_REPOSITORY/tarball/$CASCADE_SHA" \
+            | tar --extract --gzip --strip-components 1 --directory "$RUNNER_TEMP/cascade-release"
+      - name: Install git-cliff
+        run: |
+          python3 -m venv "$RUNNER_TEMP/planner"
+          "$RUNNER_TEMP/planner/bin/pip" install --quiet --disable-pip-version-check --require-hashes \
+            --requirement "$RUNNER_TEMP/cascade-release/scripts/requirements.txt"
+      - name: Plan
+        id: plan
+        env:
+          GIT_CLIFF: ${{ runner.temp }}/planner/bin/git-cliff
+          MODE: >-
+            ${{ inputs.dry-run && 'dry-run'
+            || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && 'release'
+            || 'preview' }}
+          IMAGE_PATHS: ${{ inputs.image-paths }}
+          CHART_PATH: ${{ inputs.chart-path }}
+          CHART_PATHS: ${{ inputs.chart-paths }}
+          IMAGE_TAG_PREFIX: ${{ inputs.image-tag-prefix }}
+          CHART_TAG_PREFIX: ${{ inputs.chart-tag-prefix }}
+        run: |
+          chart_paths=${CHART_PATHS:-"${CHART_PATH%/}/**"$'\n'"$IMAGE_PATHS"}
+          "$RUNNER_TEMP/cascade-release/scripts/plan" \
+            --output-dir "$RUNNER_TEMP/plan" --github-output "$GITHUB_OUTPUT" \
+            image-chart \
+            --image-paths "$IMAGE_PATHS" --chart-paths "$chart_paths" \
+            --image-tag-prefix "$IMAGE_TAG_PREFIX" --chart-tag-prefix "$CHART_TAG_PREFIX"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          case "$MODE" in
+            release) note="Releasing from \`$GITHUB_SHA\`." ;;
+            dry-run) note="Dry run: everything due is built and packaged, nothing is pushed or tagged." ;;
+            *) note="Preview: nothing is built or published." ;;
+          esac
+          {
+            cat "$RUNNER_TEMP/plan/summary.md"
+            printf '\n%s\n' "$note"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  image:
+    needs: plan
+    if: needs.plan.outputs.image-due == 'true' && needs.plan.outputs.mode != 'preview'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      released: ${{ steps.publish.outcome == 'success' }}
+    env:
+      IMAGE: ${{ inputs.image }}
+      VERSION: ${{ needs.plan.outputs.image-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Fetch cascade-release
+        if: needs.plan.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CASCADE_REPOSITORY: ${{ job.workflow_repository }}
+          CASCADE_SHA: ${{ job.workflow_sha }}
+        run: |
+          mkdir "$RUNNER_TEMP/cascade-release"
+          gh api "repos/$CASCADE_REPOSITORY/tarball/$CASCADE_SHA" \
+            | tar --extract --gzip --strip-components 1 --directory "$RUNNER_TEMP/cascade-release"
+      - name: Resolve the image registry
+        id: registry
+        run: echo "host=${IMAGE%%/*}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        if: inputs.platforms != 'linux/amd64'
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: needs.plan.outputs.mode == 'release'
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build the image
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ needs.plan.outputs.mode == 'release' }}
+          tags: ${{ inputs.image }}:${{ needs.plan.outputs.image-version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.image-version }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.image-target }}
+          cache-from: type=gha,scope=cascade-release
+          cache-to: type=gha,scope=cascade-release,mode=max
+      # The tag must come after the push: a tag without a published image is a phantom release.
+      - name: Tag and release
+        id: publish
+        if: needs.plan.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.image-tag }}
+          TARGET: ${{ needs.plan.outputs.image-target }}
+          NOTES: ${{ needs.plan.outputs.image-notes }}
+        run: |
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/image-notes.md"
+          "$RUNNER_TEMP/cascade-release/scripts/publish-release" \
+            "$TAG" "$TARGET" "image $VERSION" "$RUNNER_TEMP/image-notes.md" false
+
+  chart:
+    needs: [plan, image]
+    if: >-
+      !cancelled() && needs.plan.result == 'success'
+      && needs.plan.outputs.chart-due == 'true' && needs.plan.outputs.mode != 'preview'
+      && (needs.image.result == 'success' || needs.image.result == 'skipped')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      image-digest: ${{ steps.image.outputs.digest }}
+      released: ${{ steps.publish.outcome == 'success' }}
+    env:
+      IMAGE: ${{ inputs.image }}
+      CHART_PATH: ${{ inputs.chart-path }}
+      VERSION: ${{ needs.plan.outputs.chart-version }}
+      APP_VERSION: ${{ needs.plan.outputs.chart-app-version }}
+      MODE: ${{ needs.plan.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Fetch cascade-release
+        if: needs.plan.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CASCADE_REPOSITORY: ${{ job.workflow_repository }}
+          CASCADE_SHA: ${{ job.workflow_sha }}
+        run: |
+          mkdir "$RUNNER_TEMP/cascade-release"
+          gh api "repos/$CASCADE_REPOSITORY/tarball/$CASCADE_SHA" \
+            | tar --extract --gzip --strip-components 1 --directory "$RUNNER_TEMP/cascade-release"
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          # renovate: datasource=github-releases depName=helm/helm
+          version: v4.3.1
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        if: needs.plan.outputs.mode == 'release' && needs.image.outputs.digest == ''
+        with:
+          # renovate: datasource=github-releases depName=google/go-containerregistry
+          version: v0.22.1
+      - name: Resolve the image digest
+        id: image
+        env:
+          BUILT_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          if [ "$MODE" = dry-run ]; then
+            digest="sha256:$(printf '0%.0s' {1..64})"
+          elif [ -n "$BUILT_DIGEST" ]; then
+            digest=$BUILT_DIGEST
+          else
+            digest=$(crane digest "$IMAGE:$APP_VERSION")
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # Fails when a key is missing from values.yaml: a chart that does not implement the contract would ignore the stamp.
+      - name: Stamp the shipped image into the chart values
+        uses: mikefarah/yq@a4330671f17776618660a419ab2531e4f4dc48b6 # v4.54.2
+        env:
+          VALUES: ${{ inputs.chart-path }}/values.yaml
+          TAG_KEY: ${{ inputs.shipped-tag-key }}
+          DIGEST_KEY: ${{ inputs.shipped-digest-key }}
+          SHIPPED_TAG: ${{ needs.plan.outputs.chart-app-version }}
+          SHIPPED_DIGEST: ${{ steps.image.outputs.digest }}
+        with:
+          # No backslash-escaped quotes in here: the runner re-quotes this string for docker and mangles them.
+          cmd: >-
+            yq --exit-status '(eval(strenv(TAG_KEY)) | tag) == "!!str" and (eval(strenv(DIGEST_KEY)) | tag) == "!!str"' "$VALUES" > /dev/null
+            && yq --inplace 'eval(strenv(TAG_KEY)) = strenv(SHIPPED_TAG) | eval(strenv(DIGEST_KEY)) = strenv(SHIPPED_DIGEST)' "$VALUES"
+      - name: Package the chart
+        env:
+          SHIPPED_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          helm package "$CHART_PATH" --dependency-update \
+            --version "$VERSION" --app-version "$APP_VERSION" --destination "$RUNNER_TEMP/chart"
+          packaged_values=$(helm show values "$RUNNER_TEMP"/chart/*.tgz)
+          if ! grep --quiet --fixed-strings "$SHIPPED_DIGEST" <<< "$packaged_values"; then
+            echo "::error::The packaged chart does not carry the image digest $SHIPPED_DIGEST"
+            exit 1
+          fi
+      - name: Push the chart
+        if: needs.plan.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHART_REGISTRY: ${{ inputs.chart-registry }}
+        run: |
+          registry=${CHART_REGISTRY:-"oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"}
+          host=${registry#oci://}
+          helm registry login "${host%%/*}" --username "$GITHUB_ACTOR" --password-stdin <<< "$GH_TOKEN"
+          helm push "$RUNNER_TEMP"/chart/*.tgz "$registry"
+      # The tag must come after the push: a tag without a published chart is a phantom release.
+      - name: Tag and release
+        id: publish
+        if: needs.plan.outputs.mode == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.chart-tag }}
+          TARGET: ${{ needs.plan.outputs.chart-target }}
+          NOTES: ${{ needs.plan.outputs.chart-notes }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          {
+            # shellcheck disable=SC2016
+            printf 'Image: `%s:%s@%s`\n\n' "$IMAGE" "$APP_VERSION" "$DIGEST"
+            printf '%s\n' "$NOTES"
+          } > "$RUNNER_TEMP/chart-notes.md"
+          "$RUNNER_TEMP/cascade-release/scripts/publish-release" \
+            "$TAG" "$TARGET" "chart $VERSION" "$RUNNER_TEMP/chart-notes.md" true
