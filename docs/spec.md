@@ -299,7 +299,8 @@ Consumers pin `@<version>`, and Renovate's `github-actions` manager updates the 
 | --- | --- | --- |
 | Actions | commit SHA with a version comment in the workflows | Renovate (`helpers:pinGitHubActionDigestsToSemver`) |
 | git-cliff | `scripts/requirements.txt`, PyPI wheel with hashes (`pip --require-hashes`) | Renovate (`pip_requirements`) |
-| helm, crane | `version:` of their setup actions, with a `# renovate:` comment | Renovate (custom regex manager) |
+| helm | `version:` of `azure/setup-helm` | Renovate (`github-actions`, which knows this input) |
+| crane | `version:` of `imjasonh/setup-crane`, with a `# renovate:` comment | Renovate (custom regex manager) |
 | yq | the `mikefarah/yq` action, which pins its image by digest | Renovate (`github-actions`) |
 | actionlint | `docker://rhysd/actionlint:<version>` in `ci.yml` | Renovate (`github-actions`) |
 

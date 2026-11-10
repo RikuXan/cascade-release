@@ -5,6 +5,16 @@
     "helpers:pinGitHubActionDigestsToSemver"
   ],
   "semanticCommits": "enabled",
+  "packageRules": [
+    {
+      "description": "setup-crane only publishes two-part tags, which the SemVer pinning preset filters out",
+      "matchPackageNames": [
+        "imjasonh/setup-crane"
+      ],
+      "extractVersion": "^(?<version>v\\d+\\.\\d+)$",
+      "versioning": "loose"
+    }
+  ],
   "customManagers": [
     {
       "customType": "regex",
